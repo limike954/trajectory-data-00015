@@ -1,0 +1,181 @@
+name: python-sdk
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - '*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: '3.13'
+  PYO3_USE_ABI3_FORWARD_COMPATIBILITY: 1
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Ruff
+        run: pip install ruff
+      - name: Run Ruff Check
+        run: ruff check sdks/python
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: "sdks/python"
+          command: sdist
+          args: -o dist
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist-${{ github.run_id }}
+          path: sdks/python/dist
+
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [ x86_64, aarch64 ]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Pre-pull manylinux image (debug/retry)
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -e
+          if [[ "${TARGET}" == "aarch64" ]]; then
+            ARCH_TAG="aarch64"
+          else
+            ARCH_TAG="x86_64"
+          fi
+          IMAGE="quay.io/pypa/manylinux2014_${ARCH_TAG}:latest"
+          echo "Attempting to pull $IMAGE"
+          for i in 1 2 3; do
+            if docker pull "$IMAGE"; then
+              echo "Pulled $IMAGE"
+              break
+            else
+              echo "docker pull failed (attempt $i), retrying in 10s..."
+              sleep 10
+            fi
+          done
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: manylinux2014
+          working-directory: "sdks/python"
+          command: build
+          # Explicitly limit Python versions to those supported by PyO3 0.23.x (<=3.13)
+          # This avoids failures when the container provides Python 3.14+ interpreters.
+          args: --release -o dist -i python3.9 python3.10 python3.11 python3.12 python3.13
+        env:
+          # Workaround ring 0.17 build issue
+          CFLAGS_aarch64_unknown_linux_gnu: "-D__ARM_ARCH=8"
+          RUST_LOG: debug
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}-${{ github.run_id }}
+          path: sdks/python/dist
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: "sdks/python"
+          command: build
+          # Limit Python interpreters to <=3.13 to match PyO3 support
+          args: --release -o dist -i python3.9 python3.10 python3.11 python3.12 python3.13
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-${{ github.run_id }}
+          path: sdks/python/dist
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: "sdks/python"
+          command: build
+          target: universal2-apple-darwin
+          # Limit Python interpreters to <=3.13 to match PyO3 support
+          args: --release -o dist -i python3.9 python3.10 python3.11 python3.12 python3.13
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ github.run_id }}
+          path: sdks/python/dist
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    if: "startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'"
+    permissions:
+      contents: read
+      id-token: write
+    needs: [ macos, linux, windows ]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-linux-x86_64-${{ github.run_id }}
+          path: sdks/python/dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-linux-aarch64-${{ github.run_id }}
+          path: sdks/python/dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-windows-${{ github.run_id }}
+          path: sdks/python/dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-macos-${{ github.run_id }}
+          path: sdks/python/dist
+      - name: Publish to PyPI
+        # The issue https://github.com/pypa/gh-action-pypi-publish/issues/310 has not tagged a release yet
+        # Use the commit hash to get the temporary fix
+        uses: pypa/gh-action-pypi-publish@cbd6d01d855e02aab0908c7709d5c0ddc88c617a
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true
+          packages-dir: sdks/python/dist
